@@ -1,49 +1,20 @@
 const mongoose = require('mongoose');
 const env = require('./env');
-const User = require('../models/User');
 
-const seedDefaultUser = async () => {
-  try {
-    let admin = await User.findOne({ email: 'admin@example.com' });
-    if (!admin) {
-      admin = new User({
-        name: 'Demo Admin',
-        email: 'admin@example.com',
-        passwordHash: 'password123',
-        role: 'ADMIN',
-        company: 'AI Lead Finder Inc.'
-      });
-      await admin.save();
-      console.log('🌱 Seeded admin account: admin@example.com / password123');
-    }
+mongoose.set('strictQuery', true);
 
-    let demo = await User.findOne({ email: 'demo@example.com' });
-    if (!demo) {
-      demo = new User({
-        name: 'Demo User',
-        email: 'demo@example.com',
-        passwordHash: 'password123',
-        role: 'USER',
-        company: 'LeadGen Co.'
-      });
-      await demo.save();
-      console.log('🌱 Seeded demo account: demo@example.com / password123');
-    }
-  } catch (err) {
-    console.error('Failed to seed default users:', err.message);
-  }
-};
+mongoose.connection.on('disconnected', () => console.warn('[db] MongoDB disconnected'));
+mongoose.connection.on('reconnected', () => console.log('[db] MongoDB reconnected'));
+mongoose.connection.on('error', (err) => console.error('[db] MongoDB error:', err.message));
 
 const connectDB = async () => {
-  try {
-    const conn = await mongoose.connect(env.MONGODB_URI);
-    console.log(`MongoDB Connected: ${conn.connection.host}`);
-    await seedDefaultUser();
-  } catch (error) {
-    console.error(`Error: ${error.message}`);
-    process.exit(1);
-  }
+  const conn = await mongoose.connect(env.MONGODB_URI, { serverSelectionTimeoutMS: 10000 });
+  console.log(`[db] MongoDB connected: ${conn.connection.host}/${conn.connection.name}`);
+  return conn;
 };
 
-module.exports = connectDB;
+const disconnectDB = () => mongoose.connection.close();
 
+const isDBConnected = () => mongoose.connection.readyState === 1;
+
+module.exports = { connectDB, disconnectDB, isDBConnected };

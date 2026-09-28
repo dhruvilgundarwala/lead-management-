@@ -1,39 +1,35 @@
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
 const env = require('../config/env');
+const AppError = require('../utils/AppError');
 
 const protect = async (req, res, next) => {
-  let token;
-  if (req.headers.authorization && req.headers.authorization.startsWith('Bearer')) {
-    token = req.headers.authorization.split(' ')[1];
-  }
-  
-  if (!token) {
-    return res.status(401).json({ success: false, message: 'Not authorized to access this route' });
+  const [scheme, token] = (req.headers.authorization || '').split(' ');
+  if (scheme !== 'Bearer' || !token) {
+    throw new AppError('Not authorized to access this route', 401);
   }
 
+  let decoded;
   try {
-    const decoded = jwt.verify(token, env.JWT_SECRET);
-    req.user = await User.findById(decoded.id).select('-passwordHash');
-    if (!req.user) {
-      return res.status(401).json({ success: false, message: 'User no longer exists' });
-    }
-    if (!req.user.isActive) {
-      return res.status(403).json({ success: false, message: 'Account disabled' });
-    }
-    next();
-  } catch (error) {
-    return res.status(401).json({ success: false, message: 'Not authorized' });
+    decoded = jwt.verify(token, env.JWT_SECRET);
+  } catch (err) {
+    const message = err.name === 'TokenExpiredError' ? 'Session expired, please log in again' : 'Not authorized';
+    throw new AppError(message, 401);
   }
+
+  const user = await User.findById(decoded.id);
+  if (!user) throw new AppError('User no longer exists', 401);
+  if (!user.isActive) throw new AppError('Account disabled', 403);
+
+  req.user = user;
+  next();
 };
 
-const authorize = (...roles) => {
-  return (req, res, next) => {
-    if (!roles.includes(req.user.role)) {
-      return res.status(403).json({ success: false, message: `User role ${req.user.role} is not authorized` });
-    }
-    next();
-  };
+const authorize = (...roles) => (req, res, next) => {
+  if (!roles.includes(req.user.role)) {
+    throw new AppError(`User role ${req.user.role} is not authorized`, 403);
+  }
+  next();
 };
 
 module.exports = { protect, authorize };

@@ -1,77 +1,89 @@
-const axios = require('axios');
-const scraperService = require('../scraping/scraper.service');
+const dns = require('node:dns').promises;
 const Lead = require('../../models/Lead');
+const AppError = require('../../utils/AppError');
+const { fetchPublicPage } = require('./safeHttp');
+const { extractEmails, findContactPageUrl } = require('../scraping/scraper.service');
+const { scoreLead } = require('../scoring.service');
+
+// Some machines (VPNs, local DNS proxies) only answer ordinary lookups, not MX queries.
+// Fall back to public resolvers when the system resolver can't be reached.
+const publicResolver = new dns.Resolver({ timeout: 3000, tries: 2 });
+publicResolver.setServers(['1.1.1.1', '8.8.8.8']);
+const RESOLVER_UNREACHABLE = ['ECONNREFUSED', 'ETIMEOUT', 'ESERVFAIL', 'EREFUSED'];
+
+const resolveMx = async (domain) => {
+  try {
+    return await dns.resolveMx(domain);
+  } catch (err) {
+    if (RESOLVER_UNREACHABLE.includes(err.code)) return publicResolver.resolveMx(domain);
+    throw err;
+  }
+};
+
+/** true/false if the email's domain has/lacks mail servers, null if DNS couldn't tell. */
+const domainAcceptsMail = async (email) => {
+  const domain = email.split('@')[1];
+  try {
+    const mx = await resolveMx(domain);
+    return mx.length > 0;
+  } catch (err) {
+    if (err.code === 'ENOTFOUND' || err.code === 'ENODATA') return false;
+    return null;
+  }
+};
 
 class VerificationService {
-  
-  async checkWebsiteAvailability(url) {
-    if (!url) return 'likely_none';
-    
-    let checkUrl = url;
-    if (!checkUrl.startsWith('http')) checkUrl = 'http://' + checkUrl;
-    
-    try {
-      await axios.head(checkUrl, { 
-        timeout: 8000,
-        validateStatus: (status) => status < 400
-      });
-      return 'verified_found';
-    } catch (error) {
+  /**
+   * Re-checks a lead's contact details using only free, public sources:
+   *  - website: is it actually online? (a dead website is itself a sales opportunity)
+   *  - email:   scraped from the website if missing; domain checked for MX records
+   */
+  async verifyLead(leadId, ownerId) {
+    const lead = await Lead.findOne({ _id: leadId, owner: ownerId });
+    if (!lead) throw AppError.notFound('Lead');
+
+    const now = new Date();
+    const contact = lead.contact;
+    let emailFromSite = false;
+
+    if (contact.website) {
       try {
-        await axios.get(checkUrl, { timeout: 8000, validateStatus: (status) => status < 400 });
-        return 'verified_found';
-      } catch (e) {
-        return 'verification_failed';
-      }
-    }
-  }
+        const home = await fetchPublicPage(contact.website);
+        contact.websiteStatus = 'verified_found';
 
-  async verifyLead(leadId) {
-    const lead = await Lead.findById(leadId);
-    if (!lead) throw new Error('Lead not found');
-
-    if (!lead.verification) {
-      lead.verification = {};
-    }
-
-    let websiteStatus = lead.contact?.websiteStatus || 'unknown';
-    let email = lead.contact?.email;
-    let emailStatus = lead.contact?.emailStatus || 'unknown';
-    
-    if (lead.contact.website && websiteStatus !== 'verified_found') {
-      websiteStatus = await this.checkWebsiteAvailability(lead.contact.website);
-      lead.contact.websiteStatus = websiteStatus;
-      lead.verification.websiteCheckedAt = new Date();
-    }
-
-    if (websiteStatus === 'verified_found' && lead.contact.website) {
-      let url = lead.contact.website;
-      if (!url.startsWith('http')) url = 'http://' + url;
-      
-      const $ = await scraperService.scrapeHtml(url);
-      if ($) {
-        const foundEmails = scraperService.extractEmails($);
-        if (foundEmails.length > 0) {
-          if (!email || emailStatus !== 'verified_public') {
-            email = foundEmails[0]; 
-            emailStatus = 'verified_public';
+        let emails = extractEmails(home.html, home.url);
+        if (!emails.length) {
+          const contactUrl = findContactPageUrl(home.html, home.url);
+          if (contactUrl) {
+            const page = await fetchPublicPage(contactUrl).catch(() => null);
+            if (page) emails = extractEmails(page.html, page.url);
           }
         }
+        if (emails.length && (!contact.email || contact.emailStatus !== 'verified_public')) {
+          contact.email = emails[0];
+          emailFromSite = true;
+        }
+      } catch (err) {
+        console.warn(`[verify] Website check failed for lead ${lead._id}: ${err.message}`);
+        contact.websiteStatus = 'verification_failed';
       }
-      lead.verification.emailCheckedAt = new Date();
+      lead.verification.websiteCheckedAt = now;
+    } else {
+      contact.websiteStatus = 'not_listed';
     }
 
-    lead.contact.email = email;
-    lead.contact.emailStatus = emailStatus;
-    lead.verification.lastVerifiedAt = new Date();
-    
-    let newScore = 0;
-    if (email) newScore += 30;
-    if (lead.contact.phone) newScore += 10;
-    if (websiteStatus === 'verified_found') newScore += 10;
-    if (lead.location.address) newScore += 10;
-    lead.score = newScore;
-    
+    if (contact.email) {
+      const acceptsMail = await domainAcceptsMail(contact.email);
+      if (acceptsMail === false) contact.emailStatus = 'invalid';
+      else if (emailFromSite) contact.emailStatus = 'verified_public';
+      else if (contact.emailStatus !== 'verified_public') contact.emailStatus = 'public_unverified';
+      lead.verification.emailCheckedAt = now;
+    } else {
+      contact.emailStatus = 'not_found';
+    }
+
+    lead.verification.lastVerifiedAt = now;
+    lead.score = scoreLead(lead);
     await lead.save();
     return lead;
   }

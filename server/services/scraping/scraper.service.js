@@ -1,37 +1,44 @@
-const axios = require('axios');
 const cheerio = require('cheerio');
 
-class ScraperService {
-  constructor() {
-    this.timeout = 10000;
-  }
+const EMAIL_REGEX = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,24}/gi;
+const IGNORED_EMAIL = /\.(png|jpe?g|gif|svg|webp|css|js)$|@(example|domain|email|sentry|wixpress|sentry-next)\.|^(your|name|user|test)@/i;
 
-  async scrapeHtml(url) {
-    try {
-      const response = await axios.get(url, {
-        timeout: this.timeout,
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
-        }
-      });
-      return cheerio.load(response.data);
-    } catch (error) {
-      console.error(`Scrape HTML error for ${url}:`, error.message);
-      return null;
-    }
-  }
+/**
+ * Extracts public email addresses from an HTML page. `mailto:` links are trusted most;
+ * addresses on the site's own domain are ranked first.
+ */
+const extractEmails = (html, siteUrl) => {
+  if (!html) return [];
+  const $ = cheerio.load(html);
 
-  extractEmails($) {
-    if (!$) return [];
-    const text = $('body').text();
-    const emailRegex = /([a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+\.[a-zA-Z0-9._-]+)/gi;
-    const matches = text.match(emailRegex) || [];
-    const validEmails = matches
-      .map(e => e.toLowerCase())
-      .filter(e => !e.includes('.png') && !e.includes('.jpg') && !e.includes('example.com'))
-      .filter((value, index, self) => self.indexOf(value) === index);
-    return validEmails;
-  }
-}
+  const fromLinks = $('a[href^="mailto:"]')
+    .map((_, el) => decodeURIComponent(($(el).attr('href') || '').slice(7).split('?')[0]))
+    .get();
+  const fromText = $('body').text().match(EMAIL_REGEX) || [];
 
-module.exports = new ScraperService();
+  const siteDomain = siteUrl ? new URL(siteUrl).hostname.replace(/^www\./, '') : '';
+  const unique = [...new Set([...fromLinks, ...fromText].map((e) => e.trim().toLowerCase()))].filter(
+    (e) => /^[^\s@]+@[^\s@]+\.[a-z]{2,}$/.test(e) && !IGNORED_EMAIL.test(e)
+  );
+
+  return unique.sort((a, b) => Number(b.endsWith(`@${siteDomain}`)) - Number(a.endsWith(`@${siteDomain}`)));
+};
+
+/** Finds a same-site "contact" page link, if any. */
+const findContactPageUrl = (html, siteUrl) => {
+  if (!html) return null;
+  const $ = cheerio.load(html);
+  const href = $('a[href]')
+    .map((_, el) => $(el).attr('href'))
+    .get()
+    .find((h) => /contact/i.test(h) && !/^mailto:|^tel:/i.test(h));
+  if (!href) return null;
+  try {
+    const url = new URL(href, siteUrl);
+    return url.hostname === new URL(siteUrl).hostname ? url.toString() : null;
+  } catch {
+    return null;
+  }
+};
+
+module.exports = { extractEmails, findContactPageUrl };

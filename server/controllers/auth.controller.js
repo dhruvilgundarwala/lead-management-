@@ -1,61 +1,57 @@
 const jwt = require('jsonwebtoken');
+const bcrypt = require('bcrypt');
 const User = require('../models/User');
 const env = require('../config/env');
+const AppError = require('../utils/AppError');
 
-const generateToken = (id) => {
-  return jwt.sign({ id }, env.JWT_SECRET, { expiresIn: env.JWT_EXPIRES_IN });
+const signToken = (id) => jwt.sign({ id }, env.JWT_SECRET, { expiresIn: env.JWT_EXPIRES_IN });
+
+const authPayload = (user) => ({
+  _id: user._id,
+  name: user.name,
+  email: user.email,
+  role: user.role,
+  company: user.company,
+  token: signToken(user._id),
+});
+
+// Compared against when the email doesn't exist, so response time doesn't reveal registered emails.
+const DUMMY_HASH = bcrypt.hashSync('timing-attack-dummy-password', 12);
+
+exports.register = async (req, res) => {
+  const { name, email, password, company } = req.validated.body;
+
+  if (await User.exists({ email })) {
+    throw new AppError('An account with this email already exists', 409);
+  }
+
+  const user = new User({ name, email, company });
+  await user.setPassword(password);
+  await user.save();
+
+  res.status(201).json({ success: true, data: authPayload(user) });
 };
 
-exports.register = async (req, res, next) => {
-  try {
-    const { name, email, password, company } = req.body;
-    const userExists = await User.findOne({ email });
-    if (userExists) {
-      return res.status(400).json({ success: false, message: 'User already exists' });
-    }
-    const user = await User.create({
-      name, email, passwordHash: password, company
-    });
-    const token = generateToken(user._id);
-    res.status(201).json({
-      success: true,
-      data: { _id: user._id, name: user.name, email: user.email, role: user.role, token }
-    });
-  } catch (error) { next(error); }
+exports.login = async (req, res) => {
+  const { email, password } = req.validated.body;
+
+  const user = await User.findOne({ email }).select('+passwordHash');
+  const valid = user ? await user.matchPassword(password) : await bcrypt.compare(password, DUMMY_HASH);
+
+  if (!user || !valid) throw new AppError('Invalid email or password', 401);
+  if (!user.isActive) throw new AppError('Account is disabled', 403);
+
+  user.lastLoginAt = new Date();
+  await user.save();
+
+  res.json({ success: true, data: authPayload(user) });
 };
 
-exports.login = async (req, res, next) => {
-  try {
-    const { email, password } = req.body;
-    const user = await User.findOne({ email });
-    if (!user) {
-      return res.status(401).json({ success: false, message: 'Invalid credentials' });
-    }
-    if (!user.isActive) {
-      return res.status(403).json({ success: false, message: 'Account is disabled' });
-    }
-    const isMatch = await user.matchPassword(password);
-    if (!isMatch) {
-      return res.status(401).json({ success: false, message: 'Invalid credentials' });
-    }
-    user.lastLoginAt = Date.now();
-    await user.save();
-    
-    const token = generateToken(user._id);
-    res.json({
-      success: true,
-      data: { _id: user._id, name: user.name, email: user.email, role: user.role, token }
-    });
-  } catch (error) { next(error); }
+exports.getMe = async (req, res) => {
+  res.json({ success: true, data: req.user });
 };
 
-exports.getMe = async (req, res, next) => {
-  try {
-    const user = await User.findById(req.user.id).select('-passwordHash');
-    res.json({ success: true, data: user });
-  } catch (error) { next(error); }
-};
-
-exports.logout = async (req, res, next) => {
+// JWTs are stateless; the client discards its token. Kept for API symmetry.
+exports.logout = async (req, res) => {
   res.json({ success: true, message: 'Logged out successfully' });
 };
